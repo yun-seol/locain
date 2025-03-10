@@ -1,6 +1,6 @@
-# PandaRank API
+# locain API
 
-인플루언서 분석 및 체험단 관리 플랫폼 API
+체험단 관리 플랫폼 API
 
 ## 기능
 
