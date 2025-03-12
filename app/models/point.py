@@ -20,11 +20,11 @@ class Point(Base):
     type = Column(SQLEnum(PointType), nullable=False)
     description = Column(String, nullable=True)
     campaign_id = Column(Integer, ForeignKey("campaigns.id"), nullable=True)
-    review_id = Column(Integer, ForeignKey("reviews.id"), nullable=True)
+    review_id = Column(Integer, ForeignKey("review_contents.id"), nullable=True)
     expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
     user = relationship("User", back_populates="points")
     campaign = relationship("Campaign", back_populates="points")
-    review = relationship("Review", back_populates="points") 
+    review = relationship("ReviewContent", back_populates="points") 
