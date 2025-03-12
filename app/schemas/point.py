@@ -1,7 +1,7 @@
 from typing import Optional
 from datetime import datetime
 from pydantic import BaseModel, Field
-from app.models.point import PointTransactionType
+from app.models.point import PointType
 
 class PointBase(BaseModel):
     amount: float = Field(..., description="포인트 금액")
@@ -26,7 +26,7 @@ class PointResponse(PointBase):
     id: int
     user_id: int
     balance: float
-    type: PointTransactionType
+    type: PointType
     created_at: datetime
 
     class Config:
