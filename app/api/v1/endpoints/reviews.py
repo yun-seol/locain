@@ -5,7 +5,7 @@ from app.api import deps
 from app.models.user import User, UserType
 from app.models.review import ReviewContent, ReviewImage, ReviewStatus
 from app.models.campaign import CampaignApplication
-from app.models.point import Point, PointTransactionType
+from app.models.point import Point, PointType
 from app.schemas.review import (
     ReviewContentCreate,
     ReviewContentUpdate,
@@ -135,7 +135,7 @@ def approve_review(
     point = Point(
         user_id=review.influencer_id,
         amount=campaign.reward_amount,
-        type=PointTransactionType.EARN,
+        type=PointType.EARN,
         description=f"리뷰 승인 보상: {campaign.title}",
         campaign_id=campaign.id,
         review_id=review.id,
