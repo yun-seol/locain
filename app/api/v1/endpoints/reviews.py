@@ -5,6 +5,7 @@ from app.api import deps
 from app.models.user import User, UserType
 from app.models.review import ReviewContent, ReviewImage, ReviewStatus
 from app.models.campaign import CampaignApplication
+from app.models.point import Point, PointTransactionType
 from app.schemas.review import (
     ReviewContentCreate,
     ReviewContentUpdate,
@@ -14,7 +15,10 @@ from app.schemas.review import (
     ReviewImageUpdate,
     ReviewImageResponse,
     ReviewImageList,
-    ReviewStats
+    ReviewStats,
+    ReviewCreate,
+    ReviewUpdate,
+    ReviewResponse
 )
 from app.db.database import get_db
 from datetime import datetime
@@ -23,62 +27,201 @@ import os
 
 router = APIRouter()
 
-@router.post("/", response_model=ReviewContentResponse)
-async def create_review(
+@router.post("/", response_model=ReviewResponse)
+def create_review(
     *,
     db: Session = Depends(get_db),
-    review_in: ReviewContentCreate,
-    current_user: User = Depends(deps.get_current_active_user),
+    review_in: ReviewCreate,
+    current_user: User = Depends(deps.get_current_active_user)
 ) -> Any:
     """
     새로운 리뷰를 생성합니다.
     """
     if current_user.user_type != UserType.INFLUENCER:
-        raise HTTPException(
-            status_code=403,
-            detail="인플루언서만 리뷰를 작성할 수 있습니다.",
-        )
-    
-    # 캠페인 신청 확인
-    application = db.query(CampaignApplication).filter(
-        CampaignApplication.id == review_in.campaign_application_id,
-        CampaignApplication.influencer_id == current_user.id
-    ).first()
-    
-    if not application:
-        raise HTTPException(
-            status_code=404,
-            detail="캠페인 신청을 찾을 수 없습니다.",
-        )
-    
-    # 이미 리뷰가 작성되었는지 확인
-    existing_review = db.query(ReviewContent).filter(
-        ReviewContent.campaign_application_id == review_in.campaign_application_id
-    ).first()
-    
-    if existing_review:
-        raise HTTPException(
-            status_code=400,
-            detail="이미 리뷰가 작성되었습니다.",
-        )
+        raise HTTPException(status_code=403, detail="인플루언서만 리뷰를 작성할 수 있습니다.")
     
     review = ReviewContent(
         **review_in.dict(),
         influencer_id=current_user.id,
-        status=ReviewStatus.PENDING
+        status=ReviewStatus.DRAFT
     )
     db.add(review)
     db.commit()
     db.refresh(review)
     return review
 
-@router.get("/", response_model=ReviewContentList)
-def read_reviews(
+@router.put("/{review_id}", response_model=ReviewResponse)
+def update_review(
+    *,
     db: Session = Depends(get_db),
+    review_id: int,
+    review_in: ReviewUpdate,
+    current_user: User = Depends(deps.get_current_active_user)
+) -> Any:
+    """
+    리뷰를 수정합니다.
+    """
+    review = db.query(ReviewContent).filter(ReviewContent.id == review_id).first()
+    if not review:
+        raise HTTPException(status_code=404, detail="리뷰를 찾을 수 없습니다.")
+    
+    if review.influencer_id != current_user.id and current_user.user_type != UserType.ADMIN:
+        raise HTTPException(status_code=403, detail="리뷰를 수정할 권한이 없습니다.")
+    
+    if review.status not in [ReviewStatus.DRAFT, ReviewStatus.REJECTED]:
+        raise HTTPException(status_code=400, detail="초안 또는 거절된 상태의 리뷰만 수정할 수 있습니다.")
+    
+    for field, value in review_in.dict(exclude_unset=True).items():
+        setattr(review, field, value)
+    
+    db.add(review)
+    db.commit()
+    db.refresh(review)
+    return review
+
+@router.post("/{review_id}/submit", response_model=ReviewResponse)
+def submit_review(
+    *,
+    db: Session = Depends(get_db),
+    review_id: int,
+    current_user: User = Depends(deps.get_current_active_user)
+) -> Any:
+    """
+    리뷰를 제출합니다.
+    """
+    review = db.query(ReviewContent).filter(ReviewContent.id == review_id).first()
+    if not review:
+        raise HTTPException(status_code=404, detail="리뷰를 찾을 수 없습니다.")
+    
+    if review.influencer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="리뷰를 제출할 권한이 없습니다.")
+    
+    if review.status not in [ReviewStatus.DRAFT, ReviewStatus.REJECTED]:
+        raise HTTPException(status_code=400, detail="초안 또는 거절된 상태의 리뷰만 제출할 수 있습니다.")
+    
+    review.status = ReviewStatus.SUBMITTED
+    review.submission_date = datetime.utcnow()
+    db.add(review)
+    db.commit()
+    db.refresh(review)
+    return review
+
+@router.post("/{review_id}/approve", response_model=ReviewResponse)
+def approve_review(
+    *,
+    db: Session = Depends(get_db),
+    review_id: int,
+    current_user: User = Depends(deps.get_current_active_user)
+) -> Any:
+    """
+    리뷰를 승인합니다. (관리자 또는 브랜드 전용)
+    """
+    review = db.query(ReviewContent).filter(ReviewContent.id == review_id).first()
+    if not review:
+        raise HTTPException(status_code=404, detail="리뷰를 찾을 수 없습니다.")
+    
+    campaign = review.campaign
+    if current_user.user_type != UserType.ADMIN and campaign.brand_id != current_user.id:
+        raise HTTPException(status_code=403, detail="리뷰를 승인할 권한이 없습니다.")
+    
+    if review.status != ReviewStatus.SUBMITTED:
+        raise HTTPException(status_code=400, detail="제출된 상태의 리뷰만 승인할 수 있습니다.")
+    
+    review.status = ReviewStatus.APPROVED
+    review.approval_date = datetime.utcnow()
+    db.add(review)
+    
+    # 포인트 적립
+    point = Point(
+        user_id=review.influencer_id,
+        amount=campaign.reward_amount,
+        type=PointTransactionType.EARN,
+        description=f"리뷰 승인 보상: {campaign.title}",
+        campaign_id=campaign.id,
+        review_id=review.id,
+        expires_at=datetime.utcnow().replace(year=datetime.utcnow().year + 1)  # 1년 후 만료
+    )
+    db.add(point)
+    
+    db.commit()
+    db.refresh(review)
+    return review
+
+@router.post("/{review_id}/reject", response_model=ReviewResponse)
+def reject_review(
+    *,
+    db: Session = Depends(get_db),
+    review_id: int,
+    rejection_reason: str,
+    required_modifications: str = None,
+    current_user: User = Depends(deps.get_current_active_user)
+) -> Any:
+    """
+    리뷰를 거절합니다. (관리자 또는 브랜드 전용)
+    """
+    review = db.query(ReviewContent).filter(ReviewContent.id == review_id).first()
+    if not review:
+        raise HTTPException(status_code=404, detail="리뷰를 찾을 수 없습니다.")
+    
+    campaign = review.campaign
+    if current_user.user_type != UserType.ADMIN and campaign.brand_id != current_user.id:
+        raise HTTPException(status_code=403, detail="리뷰를 거절할 권한이 없습니다.")
+    
+    if review.status != ReviewStatus.SUBMITTED:
+        raise HTTPException(status_code=400, detail="제출된 상태의 리뷰만 거절할 수 있습니다.")
+    
+    review.status = ReviewStatus.REJECTED
+    review.rejection_reason = rejection_reason
+    review.required_modifications = required_modifications
+    db.add(review)
+    db.commit()
+    db.refresh(review)
+    return review
+
+@router.post("/{review_id}/complete", response_model=ReviewResponse)
+def complete_review(
+    *,
+    db: Session = Depends(get_db),
+    review_id: int,
+    platform_url: str,
+    views: int = 0,
+    likes: int = 0,
+    comments: int = 0,
+    current_user: User = Depends(deps.get_current_active_user)
+) -> Any:
+    """
+    리뷰를 완료 처리합니다.
+    """
+    review = db.query(ReviewContent).filter(ReviewContent.id == review_id).first()
+    if not review:
+        raise HTTPException(status_code=404, detail="리뷰를 찾을 수 없습니다.")
+    
+    if review.influencer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="리뷰를 완료 처리할 권한이 없습니다.")
+    
+    if review.status != ReviewStatus.APPROVED:
+        raise HTTPException(status_code=400, detail="승인된 상태의 리뷰만 완료 처리할 수 있습니다.")
+    
+    review.status = ReviewStatus.COMPLETED
+    review.platform_url = platform_url
+    review.views = views
+    review.likes = likes
+    review.comments = comments
+    review.completion_date = datetime.utcnow()
+    db.add(review)
+    db.commit()
+    db.refresh(review)
+    return review
+
+@router.get("/", response_model=List[ReviewResponse])
+def read_reviews(
+    *,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(deps.get_current_active_user),
     skip: int = 0,
     limit: int = 100,
-    status: Optional[ReviewStatus] = None,
-    current_user: User = Depends(deps.get_current_active_user),
+    campaign_id: int = None,
+    status: ReviewStatus = None
 ) -> Any:
     """
     리뷰 목록을 조회합니다.
@@ -88,117 +231,35 @@ def read_reviews(
     if current_user.user_type == UserType.INFLUENCER:
         query = query.filter(ReviewContent.influencer_id == current_user.id)
     elif current_user.user_type == UserType.BRAND:
-        query = query.join(CampaignApplication).filter(
-            CampaignApplication.brand_id == current_user.id
-        )
+        query = query.join(ReviewContent.campaign).filter(ReviewContent.campaign.has(brand_id=current_user.id))
     
+    if campaign_id:
+        query = query.filter(ReviewContent.campaign_id == campaign_id)
     if status:
         query = query.filter(ReviewContent.status == status)
     
-    total = query.count()
-    reviews = query.offset(skip).limit(limit).all()
-    
-    return {
-        "total": total,
-        "items": reviews
-    }
+    reviews = query.order_by(ReviewContent.id.desc()).offset(skip).limit(limit).all()
+    return reviews
 
-@router.get("/{review_id}", response_model=ReviewContentResponse)
+@router.get("/{review_id}", response_model=ReviewResponse)
 def read_review(
-    review_id: int,
-    current_user: User = Depends(deps.get_current_active_user),
-    db: Session = Depends(get_db),
-) -> Any:
-    """
-    특정 리뷰의 정보를 조회합니다.
-    """
-    review = db.query(ReviewContent).filter(ReviewContent.id == review_id).first()
-    if not review:
-        raise HTTPException(
-            status_code=404,
-            detail="리뷰를 찾을 수 없습니다.",
-        )
-    
-    if current_user.user_type == UserType.INFLUENCER and review.influencer_id != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail="해당 리뷰에 대한 접근 권한이 없습니다.",
-        )
-    
-    return review
-
-@router.put("/{review_id}", response_model=ReviewContentResponse)
-def update_review(
     *,
     db: Session = Depends(get_db),
     review_id: int,
-    review_in: ReviewContentUpdate,
-    current_user: User = Depends(deps.get_current_active_user),
+    current_user: User = Depends(deps.get_current_active_user)
 ) -> Any:
     """
-    특정 리뷰의 정보를 수정합니다.
+    특정 리뷰를 조회합니다.
     """
     review = db.query(ReviewContent).filter(ReviewContent.id == review_id).first()
     if not review:
-        raise HTTPException(
-            status_code=404,
-            detail="리뷰를 찾을 수 없습니다.",
-        )
+        raise HTTPException(status_code=404, detail="리뷰를 찾을 수 없습니다.")
     
-    if review.influencer_id != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail="해당 리뷰를 수정할 권한이 없습니다.",
-        )
+    if (current_user.user_type == UserType.INFLUENCER and review.influencer_id != current_user.id) or \
+       (current_user.user_type == UserType.BRAND and review.campaign.brand_id != current_user.id):
+        raise HTTPException(status_code=403, detail="리뷰를 조회할 권한이 없습니다.")
     
-    if review.status == ReviewStatus.APPROVED:
-        raise HTTPException(
-            status_code=400,
-            detail="승인된 리뷰는 수정할 수 없습니다.",
-        )
-    
-    update_data = review_in.dict(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(review, field, value)
-    
-    review.updated_at = datetime.now()
-    db.add(review)
-    db.commit()
-    db.refresh(review)
     return review
-
-@router.delete("/{review_id}")
-def delete_review(
-    *,
-    db: Session = Depends(get_db),
-    review_id: int,
-    current_user: User = Depends(deps.get_current_active_user),
-) -> Any:
-    """
-    특정 리뷰를 삭제합니다.
-    """
-    review = db.query(ReviewContent).filter(ReviewContent.id == review_id).first()
-    if not review:
-        raise HTTPException(
-            status_code=404,
-            detail="리뷰를 찾을 수 없습니다.",
-        )
-    
-    if review.influencer_id != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail="해당 리뷰를 삭제할 권한이 없습니다.",
-        )
-    
-    if review.status == ReviewStatus.APPROVED:
-        raise HTTPException(
-            status_code=400,
-            detail="승인된 리뷰는 삭제할 수 없습니다.",
-        )
-    
-    db.delete(review)
-    db.commit()
-    return {"message": "리뷰가 삭제되었습니다."}
 
 @router.post("/{review_id}/feedback", response_model=ReviewContentResponse)
 def create_review_feedback(
